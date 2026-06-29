@@ -8,11 +8,34 @@ export const CONFIG = {
     enabled: true,
     denyModels: ["xiaomi/mimo-v2.5-pro"],
     visionModel: "qwen/qwen3-vl-32b-instruct",
-    visionPrompt: "Describe this image concisely. Focus on text, code, diagrams, and UI elements. Be specific and factual.",
-    visionMaxTokens: 512,
-    visionTimeoutMs: 30_000,
+    visionPrompt: [
+      "Respond in English only.",
+      "",
+      "For every image, do these in order:",
+      "1. Transcribe all visible text exactly as shown - errors, stack traces, logs, code, labels. Preserve formatting, line numbers, paths.",
+      "2. Describe the visual context: what tool/environment/UI is shown.",
+      "3. If this is a UI screenshot: call out every visual anomaly with spatial precision - misaligned or off-center elements, broken layouts, malformed components, overflow/clipping, inconsistent spacing or colors. Say what looks like a bug vs intentional design. Be specific: \"submit button is ~10px right of center\", \"dropdown clips below the fold\".",
+    ].join("\n"),
+    visionMaxTokens: 1024,
+    visionTimeoutMs: 60_000,
     onFailure: "placeholder" as "placeholder" | "error" | "passthrough",
     apiKey: process.env["CLAUDE_OPENROUTER_AUTH_TOKEN"] ?? "",
+  },
+  cache: {
+    maxEntries: 200,
+    ttlMs: 30 * 60 * 1000, // 30 minutes
+  },
+  limits: {
+    maxConcurrentRequests: 12,
+    maxQueuedRequests: 50,
+    maxBodyBytes: 10 * 1024 * 1024, // 10MB
+  },
+  agent: {
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: 50,
+    maxFreeSockets: 10,
+    timeout: 120_000,
   },
 };
 
