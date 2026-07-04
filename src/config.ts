@@ -6,7 +6,7 @@ export const CONFIG = {
   sseFixUserAgents: ["claude-vscode"],
   image: {
     enabled: true,
-    denyModels: ["xiaomi/mimo-v2.5-pro"],
+    denyModels: ["xiaomi/mimo-v2.5-pro", "deepseek/deepseek-v4-pro"],
     visionModel: "qwen/qwen3-vl-32b-instruct",
     visionPrompt: [
       "Respond in English only.",

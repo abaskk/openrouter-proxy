@@ -1,40 +1,14 @@
 # OpenRouter Proxy
 
-> A zero-dependency TypeScript proxy that unlocks **free Xiaomi MiMo** on OpenRouter for any client, fixes **SSE streaming** issues with VS Code Claude Code, and **intercepts images** for non-vision models by describing them via a vision model.
+> A local TypeScript proxy that makes non-Anthropic OpenRouter models work properly with Claude Code: fixes SSE streaming, intercepts and describes images for blind models, and injects client identification headers.
 
 ---
 
-## What It Does
+## Why
 
-**Free MiMo for any tool** - [Xiaomi MiMo](https://openrouter.ai/xiaomi/mimo-v2-pro) is free on OpenRouter, but only through the **OpenClaw** channel. This proxy injects the right headers automatically - works with any HTTP client.
+Claude Code in VS Code streams via Anthropic-format SSE events. OpenRouter's output for non-Anthropic models (MiMo, DeepSeek, GLM) doesn't match what Claude Code expects, causing `redacted_thinking` errors, dropped content blocks, and broken streams.
 
-**Claude Code SSE fix** - VS Code's Claude Code extension breaks when consuming OpenRouter's SSE stream due to `redacted_thinking` errors, duplicate events, and missing content block boundaries. The proxy repairs these transparently.
-
-**Image interception** - Non-vision models (MiMo, DeepSeek, etc.) can't process images. The proxy detects image blocks in requests to configured models, sends them to a vision model (Qwen3-VL-32B by default), and replaces them with text descriptions before forwarding.
-
-```
-┌──────────────────┐       ┌──────────────────────┐       ┌─────────────────┐
-│   Any AI Tool    │──────▶│  OpenRouter Proxy    │──────▶│   OpenRouter    │
-│                  │       │  localhost:8899       │       │                 │
-│  Claude Code     │◀──────│                      │◀──────│  Xiaomi MiMo    │
-│  Continue        │       │  • Inject headers    │       │  (free via      │
-│  Cline / Aider   │       │  • Fix SSE streams   │       │   OpenClaw)     │
-│  OpenAI SDK      │       │  • Intercept images  │       │                 │
-│  Any HTTP client │       │  • Concurrency limit │       │                 │
-└──────────────────┘       └──────────────────────┘       └─────────────────┘
-```
-
-| Feature | Detail |
-|---------|--------|
-| **Header injection** | Adds `HTTP-Referer` + `X-Title` to qualify for free MiMo - works with **any tool** |
-| **SSE repair** | Filters `redacted_thinking`, injects missing `content_block_stop`, fixes event order - **Claude Code only** |
-| **Image interception** | Replaces base64 images with text descriptions via vision model for non-vision targets |
-| **Vision cache** | LRU cache with TTL (30min, 200 entries) - same image hash = cached description |
-| **Concurrency limiter** | Max 12 concurrent requests, 50 queued, 10MB body limit |
-| **SSE keepalive** | Sends `: keepalive` comments during vision processing to prevent client timeout |
-| **Health check** | `GET /_health` returns proxy status, active connections, cache size |
-| **WebSocket** | Full upgrade proxy support |
-| **Graceful shutdown** | Connection draining on SIGINT/SIGTERM |
+Additionally, models like MiMo and DeepSeek can't process images - but Claude Code sends them as screenshots during tool use. The proxy intercepts those images, has a vision model describe them, and forwards the description instead.
 
 ---
 
@@ -42,41 +16,48 @@
 
 ```
 src/
-  index.ts                 # Entry point - starts the server
-  config.ts                # All configuration (listen, target, image, cache, limits)
-  types.ts                 # TypeScript interfaces (ChatRequest, ContentBlock, etc.)
-  proxy.ts                 # HTTP/WebSocket proxy, concurrency limiter, health check
-  headers.ts               # Header building (strips hop-by-hop, applies overrides)
-  sse.ts                   # SSE parsing, VS Code fixer, SSE logger transform
-  logger.ts                # Colored logging with level icons
+  index.ts              — starts the server on :8899
+  config.ts             — listen/target config, model lists, limits, headers
+  proxy.ts              — HTTP/WebSocket handler, concurrency limiter, health check
+  headers.ts            — strips hop-by-hop headers, applies client identification overrides
+  sse.ts                — SSE parser, VS Code event fixer, SSE logger transform
+  logger.ts             — colored structured logging (TTY-aware)
+  types.ts              — ContentBlock, ChatRequest, VisionApiResponse interfaces
   interceptors/
-    image.ts               # Image detection, vision model calls, LRU cache
+    image.ts            — image detection (recursive into tool_results), SHA-256 hashing,
+                          LRU cache, vision model calls with concurrency cap
 ```
 
-### Request flow
+### Request lifecycle
 
 ```
-Client request
-  │
-  ├─ /_health → respond with JSON status
-  │
-  ├─ WebSocket → proxy upgrade to OpenRouter
-  │
-  └─ HTTP
+incoming request
+  ├─ GET /_health          → status JSON
+  ├─ WebSocket upgrade     → proxied to OpenRouter
+  └─ POST /api/v1/messages
        │
-       ├─ Fast-path check: does body contain images + denied model?
-       │   ├─ No → forward to OpenRouter unchanged
-       │   └─ Yes → parse body, split mixed messages
-       │            ├─ Send SSE keepalive to client (prevents timeout)
-       │            ├─ Extract image blocks, check cache by SHA-256
-       │            ├─ Call vision model for uncached images (max 3 concurrent)
-       │            ├─ Replace image blocks with text descriptions
-       │            └─ Forward modified body to OpenRouter
+       ├─ /v1/* path?      → rewrite to /api/v1/* (VS Code sends bare /v1 endpoints)
        │
-       └─ Response
-            ├─ Claude VS Code → SSE fixer (filter redacted_thinking, fix block lifecycle)
-            ├─ Other SSE → SSE logger transform (pass-through with logging)
-            └─ Non-SSE → pipe directly
+       ├─ contains images + model in denyModels?
+       │   ├─ no  → forward body unchanged
+       │   └─ yes → parse body
+       │            ├─ split mixed tool_result+content user messages (DeepSeek compat)
+       │            ├─ start SSE keepalive (5s ping to prevent client timeout)
+       │            ├─ find all image blocks (recursive: message content + tool_results)
+       │            ├─ SHA-256 each → check 200-entry/30min LRU cache
+       │            ├─ call vision model for uncached (max 3 concurrent, 60s timeout)
+       │            ├─ replace image blocks with "[Image description]: ..." text
+       │            └─ forward modified body
+       │
+       ├─ response is SSE + user-agent is claude-vscode?
+       │   ├─ yes → SSE fixer pipeline:
+       │   │         filter redacted_thinking blocks
+       │   │         inject missing signature_delta after thinking blocks
+       │   │         inject missing content_block_stop events at correct positions
+       │   │         deduplicate message_stop, emit [DONE]
+       │   └─ no  → pipe through with SSE logging
+       │
+       └─ concurrency: max 12 active, 50 queued, 10MB body limit
 ```
 
 ---
@@ -90,105 +71,95 @@ npm install
 npm start
 ```
 
-The proxy listens on **`http://127.0.0.1:8899`**. Point your tool's base URL there:
+Point Claude Code's API base at `http://127.0.0.1:8899` - API key, paths, and body format stay the same:
 
-| Before | After |
-|--------|-------|
-| `https://openrouter.ai` | `http://127.0.0.1:8899` |
-
-Everything else (API key, paths, request body) stays the same.
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8899",
+    "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-..."
+  }
+}
+```
 
 ---
 
 ## Configuration
 
-Edit [`src/config.ts`](./src/config.ts):
+Edit `src/config.ts`:
+
+### Target models
+
+| Config | Default | Purpose |
+|--------|---------|---------|
+| `image.denyModels` | `["xiaomi/mimo-v2.5-pro", "deepseek/deepseek-v4-pro"]` | Models that get image interception |
+| `image.visionModel` | `"qwen/qwen3-vl-32b-instruct"` | Model used to describe images |
+| `image.visionMaxTokens` | `1024` | Max tokens for vision responses |
+| `image.visionTimeoutMs` | `60000` | Vision call timeout |
+| `image.onFailure` | `"placeholder"` | On vision failure: `"placeholder"` \| `"error"` \| `"passthrough"` |
+| `sseFixUserAgents` | `["claude-vscode"]` | User agents that get SSE repair |
+
+### Server
+
+| Config | Default | Purpose |
+|--------|---------|---------|
+| `listen.host` / `listen.port` | `127.0.0.1:8899` | Where the proxy binds |
+| `target.hostname` | `openrouter.ai` | Upstream |
+| `limits.maxConcurrentRequests` | `12` | Max simultaneous upstream requests |
+| `limits.maxQueuedRequests` | `50` | Max queue depth before 503 |
+| `limits.maxBodyBytes` | `10MB` | Request body cap before 413 |
+| `cache.maxEntries` | `200` | Image description LRU cache size |
+| `cache.ttlMs` | `1800000` (30 min) | Cache entry lifetime |
+
+### Headers
 
 ```ts
-export const CONFIG = {
-  listen: { host: "127.0.0.1", port: 8899 },
-  target: { protocol: "https:", hostname: "openrouter.ai", port: null },
-  ssl: { rejectUnauthorized: true },
-  verbose: true,
-  sseFixUserAgents: ["claude-vscode"],
-  image: {
-    enabled: true,
-    denyModels: ["xiaomi/mimo-v2.5-pro", "deepseek/deepseek-v4-pro"],
-    visionModel: "qwen/qwen3-vl-32b-instruct",
-    visionPrompt: "...",
-    visionMaxTokens: 1024,
-    visionTimeoutMs: 60_000,
-    onFailure: "placeholder",  // "placeholder" | "error" | "passthrough"
-    apiKey: process.env["CLAUDE_OPENROUTER_AUTH_TOKEN"] ?? "",
-  },
-  cache: {
-    maxEntries: 200,
-    ttlMs: 30 * 60 * 1000,
-  },
-  limits: {
-    maxConcurrentRequests: 12,
-    maxQueuedRequests: 50,
-    maxBodyBytes: 10 * 1024 * 1024,
-  },
-  agent: {
-    keepAlive: true,
-    timeout: 120_000,
-  },
-};
+HEADERS_OVERRIDE = {
+  "HTTP-Referer": "https://claude.ai",
+  "X-Title": "Claude Code",
+}
 ```
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `listen.host` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN) |
-| `listen.port` | `8899` | Listen port |
-| `target.hostname` | `openrouter.ai` | Upstream host |
-| `verbose` | `true` | Log every request and SSE event |
-| `sseFixUserAgents` | `["claude-vscode"]` | User agents that trigger SSE repair |
-| `image.denyModels` | MiMo, DeepSeek | Models that get image interception |
-| `image.visionModel` | `qwen/qwen3-vl-32b-instruct` | Vision model for image descriptions |
-| `image.onFailure` | `"placeholder"` | What to do when vision call fails |
-| `limits.maxConcurrentRequests` | `12` | Max simultaneous upstream requests |
-| `limits.maxBodyBytes` | `10MB` | Request body size limit |
+Injected into every upstream request so OpenRouter identifies the traffic as Claude Code.
 
-### Environment Variables
+### Environment
 
-| Variable | Description |
-|----------|-------------|
-| `CLAUDE_OPENROUTER_AUTH_TOKEN` | API key for vision model calls (falls back to request Authorization header) |
+| Variable | Purpose |
+|----------|---------|
+| `CLAUDE_OPENROUTER_AUTH_TOKEN` | API key for vision model calls. Falls back to the incoming request's `Authorization` header if unset. |
+
+---
+
+## SSE Fixes
+
+OpenRouter translates model output to Anthropic-format SSE events, but the conversion has gaps. The proxy repairs them for Claude VS Code:
+
+| Problem | Root cause | Fix |
+|---------|-----------|-----|
+| `unsupported content type: redacted_thinking` | Some providers emit redacted thinking blocks that Claude Code doesn't recognize | Filtered out |
+| Missing `content_block_stop` | OpenRouter doesn't emit stops for thinking blocks | Injected after each block at correct index |
+| Missing `signature_delta` | Claude Code expects a signature after thinking | Synthetic signature injected |
+| Duplicate `message_stop` | Multiple `message_stop` or `[DONE]` events arrive | Deduplicated, emitted once at end |
 
 ---
 
 ## Image Interception
 
-When a request to a denied model contains image blocks:
+When a request to a non-vision model contains images:
 
-1. Images are found recursively (including inside `tool_result` blocks)
-2. Each image is SHA-256 hashed and checked against the LRU cache
-3. Uncached images are sent to the vision model (max 3 concurrent)
-4. Image blocks are replaced with `[Image description]: ...` text blocks
-5. The modified request is forwarded to OpenRouter
+1. **Detect** - Fast string scan for `"type":"image"` in the request body. If the model is in `denyModels`, full parse and interception kicks in.
 
-The vision model receives a prompt that instructs it to:
-- Transcribe all visible text exactly (errors, stack traces, code)
-- Describe visual context (tool/environment/UI)
-- Call out visual anomalies with spatial precision
+2. **Split** - If any user message mixes `tool_result` blocks with text/image blocks, split into separate messages (DeepSeek rejects mixed messages).
 
-**SSE keepalive**: During vision processing, the proxy sends `: keepalive` SSE comments every 5 seconds to prevent the client from timing out.
+3. **Find** - Walk all messages recursively: top-level content blocks AND inside `tool_result` content arrays. Extract every image block.
 
----
+4. **Cache check** - SHA-256 hash each image. Skip images under 10KB decoded. Check LRU cache for matching hashes.
 
-## SSE Compatibility Fixes
+5. **Describe** - Uncached images are sent to the vision model via OpenRouter with a prompt that asks for: text transcription (errors, code, paths), visual context (tool/UI/environment), and spatial anomaly detection (misaligned elements, clipping, broken layouts).
 
-When using Claude Code in VS Code, OpenRouter translates model output into Anthropic-style streaming events. This causes compatibility issues. The proxy repairs:
+6. **Replace** - Original image blocks are replaced with `[Image description]: <vision model output>` text blocks. Cached for 30 minutes.
 
-| Problem | Fix |
-|---------|-----|
-| `redacted_thinking` content blocks | Filtered out entirely |
-| Missing `content_block_stop` events | Injected at correct positions |
-| Missing `signature_delta` for thinking blocks | Synthetic signature injected |
-| Duplicate / late `message_stop` | Deduplicated and emitted last |
-
-These fixes only apply to user agents matching `sseFixUserAgents` (default: `claude-vscode`). Other tools get the free MiMo access via header injection without SSE manipulation.
+7. **SSE keepalive** - While the vision model processes (can take 1-30s), the proxy sends `: keepalive\n\n` every 5 seconds so the client doesn't drop the connection.
 
 ---
 
@@ -196,19 +167,6 @@ These fixes only apply to user agents matching `sseFixUserAgents` (default: `cla
 
 ```bash
 curl http://localhost:8899/_health
-```
-
-Returns:
-```json
-{
-  "status": "ok",
-  "uptime": 3600,
-  "activeRequests": 2,
-  "queuedRequests": 0,
-  "activeConns": 3,
-  "imageCacheSize": 15,
-  "upstreamAgent": { "sockets": 2, "freeSockets": 1 }
-}
 ```
 
 ---

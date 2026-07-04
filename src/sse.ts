@@ -29,6 +29,14 @@ export function parseSSEBlock(block: string): SSEEvent {
   return { event, data };
 }
 
+// Lightweight parser that extracts only the event name without JSON.parse
+function parseSSEEventName(block: string): string {
+  const idx = block.indexOf("event:");
+  if (idx === -1) return "";
+  const end = block.indexOf("\n", idx);
+  return block.slice(idx + 6, end === -1 ? undefined : end).trim();
+}
+
 function writeSSE(res: http.ServerResponse, eventData: string, tag: string): void {
   if (CONFIG.verbose) {
     const color = tag.includes("filter") ? CLR.red
@@ -66,7 +74,8 @@ export function createVSCodeSSEFixer(res: http.ServerResponse): SSEFixer {
     buffer = events.pop()!;
 
     for (const raw of events) {
-      const { event, data } = parseSSEBlock(raw);
+      // Use lightweight event name parser for most events
+      const eventName = parseSSEEventName(raw);
 
       if (raw.includes('"redacted_thinking"') || isRedactedThinking) {
         writeSSE(res, raw, "filter");
@@ -80,14 +89,16 @@ export function createVSCodeSSEFixer(res: http.ServerResponse): SSEFixer {
         writeSSE(res, sig, "insert");
       }
 
-      if (event === "content_block_start") {
+      if (eventName === "content_block_start") {
         if (raw.includes('"thinking"')) isThinking = true;
         flushStopEvents(res, pendingIndexes);
+        // Only need parsed data for index extraction
+        const { data } = parseSSEBlock(raw);
         pendingIndexes.push((data as { index?: number })?.index ?? 0);
         writeSSE(res, raw, "data");
-      } else if (event === "content_block_stop") {
+      } else if (eventName === "content_block_stop") {
         writeSSE(res, raw, "filter");
-      } else if (event === "message_stop" || raw.trimEnd().endsWith("[DONE]")) {
+      } else if (eventName === "message_stop" || raw.trimEnd().endsWith("[DONE]")) {
         writeSSE(res, raw, "filter");
       } else {
         writeSSE(res, raw, "data");
@@ -116,8 +127,9 @@ export function createSSELogger(): Transform {
       for (const raw of events) {
         const trimmed = raw.trim();
         if (!trimmed) continue;
-        const { event } = parseSSEBlock(raw);
-        const tag = event || "data";
+        // Lightweight parser - no JSON.parse needed
+        const eventName = parseSSEEventName(raw);
+        const tag = eventName || "data";
         const preview = trimmed.replace(/\n/g, " ").slice(0, 120);
         log("sse", `${CLR.dim}pipe:${CLR.reset} ${CLR.dim}${tag} ${preview}${CLR.reset}`);
       }
@@ -126,8 +138,8 @@ export function createSSELogger(): Transform {
     },
     flush(cb) {
       if (buf.trim()) {
-        const { event } = parseSSEBlock(buf);
-        log("sse", `${CLR.dim}pipe:${CLR.reset} ${CLR.dim}${event || "data"} ${buf.trim().replace(/\n/g, " ").slice(0, 120)}${CLR.reset}`);
+        const eventName = parseSSEEventName(buf);
+        log("sse", `${CLR.dim}pipe:${CLR.reset} ${CLR.dim}${eventName || "data"} ${buf.trim().replace(/\n/g, " ").slice(0, 120)}${CLR.reset}`);
       }
       cb();
     },
